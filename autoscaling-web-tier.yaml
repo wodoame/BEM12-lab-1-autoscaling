@@ -1,0 +1,526 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Highly available, auto-scaling web tier using an Application Load Balancer
+  (public subnets) and an EC2 Auto Scaling Group (private subnets) across two
+  Availability Zones. Scales on CPU utilization. Instances are reachable for
+  administration only via AWS Systems Manager Session Manager (no SSH, no
+  public IPs). Deployed entirely as Infrastructure as Code.
+
+# ---------------------------------------------------------------------------
+# Metadata - groups parameters in the CloudFormation console UI
+# ---------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network configuration
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+      - Label:
+          default: Compute / Auto Scaling configuration
+        Parameters:
+          - InstanceType
+          - LatestAmiId
+          - MinSize
+          - MaxSize
+          - DesiredCapacity
+          - CpuTargetUtilization
+
+# ---------------------------------------------------------------------------
+# Parameters - keep the template repeatable and environment-agnostic
+# ---------------------------------------------------------------------------
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block for the VPC.
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the public subnet in AZ 1 (hosts the ALB and NAT Gateway).
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the public subnet in AZ 2 (hosts the ALB).
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.11.0/24
+    Description: CIDR block for the private subnet in AZ 1 (hosts EC2 instances).
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.12.0/24
+    Description: CIDR block for the private subnet in AZ 2 (hosts EC2 instances).
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: EC2 instance type for the web tier.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >-
+      Resolved automatically from SSM Public Parameter Store. Always points to
+      the latest Amazon Linux 2023 x86_64 AMI in the deployment region.
+
+  MinSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Minimum number of EC2 instances kept running by the ASG.
+
+  MaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    Description: Maximum number of EC2 instances the ASG may launch during scale-out.
+
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Initial desired number of EC2 instances launched by the ASG.
+
+  CpuTargetUtilization:
+    Type: Number
+    Default: 30
+    MinValue: 10
+    MaxValue: 90
+    Description: Target average CPU utilization (%) that triggers scale-out / scale-in.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # VPC and core networking
+  # -------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---- Public subnets (ALB + NAT Gateway live here) ----------------------
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-2
+
+  # ---- Private subnets (EC2 instances live here, no public IPs) ----------
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-2
+
+  # ---- Public route table -------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---- NAT Gateway (single, in AZ 1) for private subnet egress -----------
+  # A single NAT Gateway minimizes cost; the customer can add a second NAT
+  # in PublicSubnet2 later for full per-AZ resilience of egress traffic.
+  NatGatewayEip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat
+
+  # ---- Private route table (egress through NAT) --------------------------
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-rt
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # -------------------------------------------------------------------------
+  # Security groups
+  # -------------------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound HTTP from the internet to the ALB.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb-sg
+
+  # EC2 SG only accepts traffic sourced from the ALB SG -> no public exposure.
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP only from the Application Load Balancer.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTP from ALB only
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ec2-sg
+
+  # -------------------------------------------------------------------------
+  # IAM role for EC2 instances - grants Systems Manager access for admin
+  # without opening SSH (port 22) on the instances.
+  # -------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ec2-role
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # -------------------------------------------------------------------------
+  # Application Load Balancer + listener + target group
+  # -------------------------------------------------------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${AWS::StackName}-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-tg
+      VpcId: !Ref Vpc
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "20"
+        # Force the ALB to distribute traffic round-robin across healthy targets.
+        - Key: load_balancing.algorithm.type
+          Value: round_robin
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  # -------------------------------------------------------------------------
+  # Launch template - what every Auto Scaling instance looks like
+  # -------------------------------------------------------------------------
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        MetadataOptions:
+          HttpTokens: required          # IMDSv2 only
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 2
+        Monitoring:
+          Enabled: true                 # detailed (1-minute) CloudWatch metrics
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${AWS::StackName}-web
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+
+            # Install web server + stress-ng (used to demonstrate CPU spikes)
+            dnf update -y
+            dnf install -y httpd stress-ng
+
+            systemctl enable --now httpd
+
+            # Pull instance metadata via IMDSv2 so each page is uniquely identifiable
+            TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/local-ipv4)
+            HOSTNAME=$(hostname)
+
+            cat > /var/www/html/index.html <<HTML
+            <!doctype html>
+            <html lang="en">
+              <head>
+                <meta charset="utf-8" />
+                <title>${AWS::StackName} - Web Tier</title>
+                <style>
+                  body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 640px; }
+                  h1   { color: #232f3e; }
+                  table{ border-collapse: collapse; width: 100%; }
+                  td, th { border: 1px solid #ddd; padding: 0.5rem 0.75rem; text-align: left; }
+                  th   { background: #f2f2f2; }
+                  .ok  { color: #007e33; font-weight: 600; }
+                </style>
+              </head>
+              <body>
+                <h1>Hello from the Auto Scaling web tier</h1>
+                <p class="ok">This response was served by one specific backend instance.</p>
+                <table>
+                  <tr><th>Instance ID</th><td>$INSTANCE_ID</td></tr>
+                  <tr><th>Availability Zone</th><td>$AZ</td></tr>
+                  <tr><th>Private IP</th><td>$LOCAL_IP</td></tr>
+                  <tr><th>Hostname</th><td>$HOSTNAME</td></tr>
+                </table>
+                <p>Refresh the page repeatedly to see the ALB distribute traffic across instances.</p>
+              </body>
+            </html>
+            HTML
+
+            # Lightweight health endpoint (also used by ALB target group)
+            echo "ok" > /var/www/html/health
+
+  # -------------------------------------------------------------------------
+  # Auto Scaling Group + target tracking scaling policy
+  # -------------------------------------------------------------------------
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: HttpListener
+    Properties:
+      AutoScalingGroupName: !Sub ${AWS::StackName}-asg
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      HealthCheckType: ELB                # use ALB health checks, not just EC2
+      HealthCheckGracePeriod: 120
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-web
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        # MinSize defaults to 1, so during a rolling update we keep 0 in service
+        # and let the new instance come up before the old is replaced. This
+        # avoids needing a temporary capacity bump above MaxSize.
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+
+  CpuTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 90
+      TargetTrackingConfiguration:
+        DisableScaleIn: false
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CpuTargetUtilization
+
+# ---------------------------------------------------------------------------
+# Outputs - the customer's "single public endpoint" + handy references
+# ---------------------------------------------------------------------------
+Outputs:
+  ApplicationUrl:
+    Description: Public URL of the application (open this in a browser).
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApplicationUrl
+
+  LoadBalancerDnsName:
+    Description: DNS name of the Application Load Balancer.
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  AutoScalingGroupName:
+    Description: Name of the EC2 Auto Scaling Group serving the application.
+    Value: !Ref WebAutoScalingGroup
+
+  VpcId:
+    Description: ID of the VPC created by this stack.
+    Value: !Ref Vpc
