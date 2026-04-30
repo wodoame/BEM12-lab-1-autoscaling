@@ -206,8 +206,7 @@ Resources:
       RouteTableId: !Ref PublicRouteTable
 
   # ---- NAT Gateways (one per AZ) for private subnet egress ---------------
-  # Two NAT Gateways - one in each public subnet - so an AZ outage cannot
-  # sever outbound internet for the private subnet in the surviving AZ.
+  # Two NAT Gateways - one in each public subnet
   # Each private subnet routes through the NAT Gateway in its own AZ.
   NatGateway1Eip:
     Type: AWS::EC2::EIP
