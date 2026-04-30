@@ -43,12 +43,12 @@ Parameters:
   PublicSubnet1Cidr:
     Type: String
     Default: 10.0.1.0/24
-    Description: CIDR block for the public subnet in AZ 1 (hosts the ALB and NAT Gateway).
+    Description: CIDR block for the public subnet in AZ 1 (hosts the ALB and a NAT Gateway).
 
   PublicSubnet2Cidr:
     Type: String
     Default: 10.0.2.0/24
-    Description: CIDR block for the public subnet in AZ 2 (hosts the ALB).
+    Description: CIDR block for the public subnet in AZ 2 (hosts the ALB and a NAT Gateway).
 
   PrivateSubnet1Cidr:
     Type: String
@@ -205,54 +205,88 @@ Resources:
       SubnetId: !Ref PublicSubnet2
       RouteTableId: !Ref PublicRouteTable
 
-  # ---- NAT Gateway (single, in AZ 1) for private subnet egress -----------
-  # A single NAT Gateway minimizes cost; the customer can add a second NAT
-  # in PublicSubnet2 later for full per-AZ resilience of egress traffic.
-  NatGatewayEip:
+  # ---- NAT Gateways (one per AZ) for private subnet egress ---------------
+  # Two NAT Gateways - one in each public subnet - so an AZ outage cannot
+  # sever outbound internet for the private subnet in the surviving AZ.
+  # Each private subnet routes through the NAT Gateway in its own AZ.
+  NatGateway1Eip:
     Type: AWS::EC2::EIP
     DependsOn: InternetGatewayAttachment
     Properties:
       Domain: vpc
       Tags:
         - Key: Name
-          Value: !Sub ${AWS::StackName}-nat-eip
+          Value: !Sub ${AWS::StackName}-nat-eip-1
 
-  NatGateway:
+  NatGateway1:
     Type: AWS::EC2::NatGateway
     Properties:
-      AllocationId: !GetAtt NatGatewayEip.AllocationId
+      AllocationId: !GetAtt NatGateway1Eip.AllocationId
       SubnetId: !Ref PublicSubnet1
       Tags:
         - Key: Name
-          Value: !Sub ${AWS::StackName}-nat
+          Value: !Sub ${AWS::StackName}-nat-1
 
-  # ---- Private route table (egress through NAT) --------------------------
-  PrivateRouteTable:
+  NatGateway2Eip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat-eip-2
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2Eip.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat-2
+
+  # ---- Private route tables (one per AZ, egress through that AZ's NAT) ---
+  PrivateRouteTable1:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
       Tags:
         - Key: Name
-          Value: !Sub ${AWS::StackName}-private-rt
+          Value: !Sub ${AWS::StackName}-private-rt-1
 
-  PrivateDefaultRoute:
+  PrivateDefaultRoute1:
     Type: AWS::EC2::Route
     Properties:
-      RouteTableId: !Ref PrivateRouteTable
+      RouteTableId: !Ref PrivateRouteTable1
       DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NatGateway
+      NatGatewayId: !Ref NatGateway1
 
   PrivateSubnet1RouteTableAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet1
-      RouteTableId: !Ref PrivateRouteTable
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-rt-2
+
+  PrivateDefaultRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
 
   PrivateSubnet2RouteTableAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet2
-      RouteTableId: !Ref PrivateRouteTable
+      RouteTableId: !Ref PrivateRouteTable2
 
   # -------------------------------------------------------------------------
   # Security groups
